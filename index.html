@@ -1,0 +1,946 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DebtFree — Personal Finance & Debt Payoff Calculator</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    input:focus, select:focus, textarea:focus {
+      outline: none;
+      border-color: #4f46e5 !important;
+      box-shadow: 0 0 0 3px rgba(79,70,229,0.1);
+    }
+    .card {
+      background: white;
+      border-radius: 14px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.06);
+    }
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(10px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .fade-up { animation: fadeUp 0.25s ease both; }
+    .progress-bar { transition: width 0.6s cubic-bezier(0.4,0,0.2,1); }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
+  </style>
+</head>
+<body class="bg-slate-50 text-gray-800 antialiased">
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
+
+// ─── Utilities ────────────────────────────────────────────────────────────────
+const uid = () => Math.random().toString(36).slice(2, 9);
+
+const fmt = (n) =>
+  new Intl.NumberFormat('en-US', {
+    style: 'currency', currency: 'USD',
+    minimumFractionDigits: 0, maximumFractionDigits: 0,
+  }).format(n || 0);
+
+const fmtFull = (n) =>
+  new Intl.NumberFormat('en-US', {
+    style: 'currency', currency: 'USD',
+    minimumFractionDigits: 2, maximumFractionDigits: 2,
+  }).format(n || 0);
+
+const fmtMonths = (m) => {
+  if (!m || m <= 0) return '—';
+  if (m >= 600) return '50+ years';
+  const y = Math.floor(m / 12), mo = m % 12;
+  if (y === 0) return `${mo} mo`;
+  if (mo === 0) return `${y} yr`;
+  return `${y} yr ${mo} mo`;
+};
+
+const payoffDate = (months) => {
+  if (!months || months >= 600) return '—';
+  const d = new Date();
+  d.setMonth(d.getMonth() + months);
+  return d.toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+};
+
+const toMonthly = (amount, freq) =>
+  freq === 'yearly' ? Number(amount) / 12 : Number(amount);
+
+// ─── Debt Payoff Simulation ───────────────────────────────────────────────────
+function simulatePayoff(debts, extraPayment, strategy) {
+  if (!debts.length || debts.every(d => !d.balance || d.balance <= 0)) return null;
+
+  const sorted = [...debts].sort((a, b) =>
+    strategy === 'avalanche'
+      ? Number(b.apr) - Number(a.apr)
+      : Number(a.balance) - Number(b.balance)
+  );
+
+  const balances = {};
+  sorted.forEach(d => { balances[d.id] = Number(d.balance) || 0; });
+
+  const paidOff = new Set();
+  const payoffMonths = {};
+  let month = 0;
+  let totalInterest = 0;
+  const snapshots = [{
+    month: 0,
+    total: Object.values(balances).reduce((s, b) => s + b, 0),
+  }];
+
+  while (sorted.some(d => !paidOff.has(d.id) && balances[d.id] > 0) && month < 600) {
+    month++;
+
+    // Apply monthly interest
+    sorted.forEach(d => {
+      if (paidOff.has(d.id) || balances[d.id] <= 0) return;
+      const interest = balances[d.id] * (Number(d.apr) / 100 / 12);
+      balances[d.id] += interest;
+      totalInterest += interest;
+    });
+
+    // Extra available = initial extra + freed minimums from paid-off debts
+    const freedMinimums = sorted
+      .filter(d => paidOff.has(d.id))
+      .reduce((s, d) => s + Number(d.minimumPayment), 0);
+    let avail = Number(extraPayment) + freedMinimums;
+
+    // Apply minimum payments to active debts
+    sorted.forEach(d => {
+      if (paidOff.has(d.id) || balances[d.id] <= 0) return;
+      const pay = Math.min(Number(d.minimumPayment), balances[d.id]);
+      balances[d.id] = Math.max(0, balances[d.id] - pay);
+      if (balances[d.id] < 0.01) {
+        balances[d.id] = 0;
+        paidOff.add(d.id);
+        payoffMonths[d.id] = month;
+      }
+    });
+
+    // Apply extra to priority target(s)
+    for (const d of sorted) {
+      if (avail < 0.01) break;
+      if (paidOff.has(d.id) || balances[d.id] <= 0) continue;
+      const pay = Math.min(avail, balances[d.id]);
+      balances[d.id] -= pay;
+      avail -= pay;
+      if (balances[d.id] < 0.01) {
+        balances[d.id] = 0;
+        paidOff.add(d.id);
+        payoffMonths[d.id] = month;
+      }
+    }
+
+    snapshots.push({
+      month,
+      total: Object.values(balances).reduce((s, b) => s + b, 0),
+    });
+  }
+
+  return { totalMonths: month, payoffMonths, snapshots, totalInterest };
+}
+
+// ─── Shared UI Components ─────────────────────────────────────────────────────
+function StatCard({ label, value, sub, accent = '#4f46e5', emoji }) {
+  return (
+    <div className="card p-5 fade-up">
+      <div className="flex items-start justify-between mb-3">
+        <span className="text-xs font-semibold uppercase tracking-wide text-gray-400">{label}</span>
+        {emoji && <span className="text-xl">{emoji}</span>}
+      </div>
+      <div className="text-2xl font-bold" style={{ color: accent }}>{value}</div>
+      {sub && <div className="text-xs text-gray-400 mt-1">{sub}</div>}
+    </div>
+  );
+}
+
+function Badge({ children, color = 'gray' }) {
+  const colors = {
+    gray:   'bg-gray-100 text-gray-600',
+    indigo: 'bg-indigo-100 text-indigo-700',
+    red:    'bg-red-100 text-red-700',
+    green:  'bg-emerald-100 text-emerald-700',
+    blue:   'bg-blue-100 text-blue-700',
+    amber:  'bg-amber-100 text-amber-700',
+    purple: 'bg-purple-100 text-purple-700',
+    yellow: 'bg-yellow-100 text-yellow-700',
+    pink:   'bg-pink-100 text-pink-700',
+    teal:   'bg-teal-100 text-teal-700',
+    cyan:   'bg-cyan-100 text-cyan-700',
+    orange: 'bg-orange-100 text-orange-700',
+  };
+  return (
+    <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${colors[color] || colors.gray}`}>
+      {children}
+    </span>
+  );
+}
+
+function Btn({ children, variant = 'primary', ...props }) {
+  const base = 'px-4 py-2 rounded-lg text-sm font-medium transition-all focus:outline-none focus:ring-2 focus:ring-offset-1';
+  const variants = {
+    primary:  'bg-indigo-600 text-white hover:bg-indigo-700 focus:ring-indigo-500',
+    ghost:    'border border-gray-200 text-gray-600 hover:bg-gray-50 focus:ring-gray-300',
+    danger:   'border border-red-200 text-red-500 hover:bg-red-50 focus:ring-red-300',
+  };
+  return <button className={`${base} ${variants[variant]}`} {...props}>{children}</button>;
+}
+
+function Field({ label, error, children }) {
+  return (
+    <div>
+      {label && <label className="block text-xs font-medium text-gray-500 mb-1">{label}</label>}
+      {children}
+      {error && <p className="text-xs text-red-500 mt-1">{error}</p>}
+    </div>
+  );
+}
+
+function TextInput({ ...props }) {
+  return (
+    <input
+      className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm bg-white placeholder-gray-300"
+      {...props}
+    />
+  );
+}
+
+function SelectInput({ options, ...props }) {
+  return (
+    <select className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm bg-white" {...props}>
+      {options.map(o => (
+        typeof o === 'string'
+          ? <option key={o} value={o}>{o}</option>
+          : <option key={o.value} value={o.value}>{o.label}</option>
+      ))}
+    </select>
+  );
+}
+
+// ─── Income Page ──────────────────────────────────────────────────────────────
+const INCOME_FREQ = [{ value: 'monthly', label: 'Monthly' }, { value: 'yearly', label: 'Yearly' }];
+
+const EMPTY_INCOME = { name: '', amount: '', frequency: 'monthly' };
+
+function IncomePage({ income, setIncome }) {
+  const [form, setForm] = useState(EMPTY_INCOME);
+  const [editId, setEditId] = useState(null);
+
+  const totalMonthly = income.reduce((s, i) => s + toMonthly(i.amount, i.frequency), 0);
+
+  const f = (k) => (e) => setForm(p => ({ ...p, [k]: e.target.value }));
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (!form.name.trim() || !form.amount) return;
+    const item = { ...form, amount: Number(form.amount) };
+    if (editId) {
+      setIncome(prev => prev.map(i => i.id === editId ? { ...i, ...item } : i));
+      setEditId(null);
+    } else {
+      setIncome(prev => [...prev, { ...item, id: uid() }]);
+    }
+    setForm(EMPTY_INCOME);
+  };
+
+  const startEdit = (item) => {
+    setForm({ name: item.name, amount: String(item.amount), frequency: item.frequency });
+    setEditId(item.id);
+  };
+
+  const cancel = () => { setEditId(null); setForm(EMPTY_INCOME); };
+
+  return (
+    <div className="space-y-6 fade-up">
+      <div className="card p-6">
+        <h2 className="font-semibold text-gray-700 mb-4">
+          {editId ? 'Edit Income Source' : 'Add Income Source'}
+        </h2>
+        <form onSubmit={handleSubmit} className="grid grid-cols-1 sm:grid-cols-[1fr_140px_120px_auto] gap-3 items-end">
+          <Field label="Name">
+            <TextInput placeholder="e.g. Salary, Freelance..." value={form.name} onChange={f('name')} required />
+          </Field>
+          <Field label="Amount ($)">
+            <TextInput placeholder="5,000" type="number" min="0" step="0.01" value={form.amount} onChange={f('amount')} required />
+          </Field>
+          <Field label="Frequency">
+            <SelectInput options={INCOME_FREQ} value={form.frequency} onChange={f('frequency')} />
+          </Field>
+          <div className="flex gap-2 pb-0.5">
+            <Btn type="submit">{editId ? 'Update' : 'Add'}</Btn>
+            {editId && <Btn type="button" variant="ghost" onClick={cancel}>Cancel</Btn>}
+          </div>
+        </form>
+      </div>
+
+      <div className="card p-6">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="font-semibold text-gray-700">Income Sources</h2>
+          <span className="text-sm font-bold text-emerald-600 bg-emerald-50 px-3 py-1 rounded-full">
+            {fmt(totalMonthly)} / mo
+          </span>
+        </div>
+        {income.length === 0 ? (
+          <p className="text-center text-gray-400 text-sm py-10">
+            No income sources yet — add one above to get started.
+          </p>
+        ) : (
+          <div className="divide-y divide-gray-50">
+            {income.map(item => (
+              <div key={item.id} className="flex items-center justify-between py-3 hover:bg-slate-50 -mx-2 px-2 rounded-lg">
+                <div>
+                  <p className="font-medium text-sm">{item.name}</p>
+                  <p className="text-xs text-gray-400">
+                    {fmtFull(item.amount)}{item.frequency === 'yearly' ? '/yr' : '/mo'}
+                  </p>
+                </div>
+                <div className="flex items-center gap-3">
+                  <span className="text-sm font-semibold text-emerald-600">
+                    {fmtFull(toMonthly(item.amount, item.frequency))}/mo
+                  </span>
+                  <Btn variant="ghost" onClick={() => startEdit(item)}>Edit</Btn>
+                  <Btn variant="danger" onClick={() => setIncome(p => p.filter(i => i.id !== item.id))}>✕</Btn>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Expenses Page ────────────────────────────────────────────────────────────
+const EXPENSE_CATS = [
+  'Housing', 'Food', 'Transportation', 'Utilities',
+  'Healthcare', 'Entertainment', 'Personal', 'Subscriptions', 'Other',
+];
+const CAT_COLORS = {
+  Housing: 'blue', Food: 'orange', Transportation: 'yellow',
+  Utilities: 'cyan', Healthcare: 'red', Entertainment: 'purple',
+  Personal: 'pink', Subscriptions: 'indigo', Other: 'gray',
+};
+const EMPTY_EXPENSE = { name: '', amount: '', category: 'Housing', frequency: 'monthly' };
+
+function ExpensesPage({ expenses, setExpenses }) {
+  const [form, setForm] = useState(EMPTY_EXPENSE);
+  const [editId, setEditId] = useState(null);
+
+  const totalMonthly = expenses.reduce((s, e) => s + toMonthly(e.amount, e.frequency), 0);
+  const f = (k) => (e) => setForm(p => ({ ...p, [k]: e.target.value }));
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (!form.name.trim() || !form.amount) return;
+    const item = { ...form, amount: Number(form.amount) };
+    if (editId) {
+      setExpenses(prev => prev.map(i => i.id === editId ? { ...i, ...item } : i));
+      setEditId(null);
+    } else {
+      setExpenses(prev => [...prev, { ...item, id: uid() }]);
+    }
+    setForm(EMPTY_EXPENSE);
+  };
+
+  const startEdit = (item) => {
+    setForm({ name: item.name, amount: String(item.amount), category: item.category || 'Other', frequency: item.frequency });
+    setEditId(item.id);
+  };
+
+  const cancel = () => { setEditId(null); setForm(EMPTY_EXPENSE); };
+
+  // Group by category
+  const grouped = {};
+  expenses.forEach(e => {
+    const cat = e.category || 'Other';
+    if (!grouped[cat]) grouped[cat] = [];
+    grouped[cat].push(e);
+  });
+
+  return (
+    <div className="space-y-6 fade-up">
+      <div className="card p-6">
+        <h2 className="font-semibold text-gray-700 mb-4">
+          {editId ? 'Edit Expense' : 'Add Expense'}
+        </h2>
+        <form onSubmit={handleSubmit} className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-[1fr_130px_150px_120px_auto] gap-3 items-end">
+          <Field label="Name">
+            <TextInput placeholder="e.g. Rent, Groceries..." value={form.name} onChange={f('name')} required />
+          </Field>
+          <Field label="Amount ($)">
+            <TextInput placeholder="1,500" type="number" min="0" step="0.01" value={form.amount} onChange={f('amount')} required />
+          </Field>
+          <Field label="Category">
+            <SelectInput options={EXPENSE_CATS} value={form.category} onChange={f('category')} />
+          </Field>
+          <Field label="Frequency">
+            <SelectInput options={INCOME_FREQ} value={form.frequency} onChange={f('frequency')} />
+          </Field>
+          <div className="flex gap-2 pb-0.5">
+            <Btn type="submit">{editId ? 'Update' : 'Add'}</Btn>
+            {editId && <Btn type="button" variant="ghost" onClick={cancel}>Cancel</Btn>}
+          </div>
+        </form>
+      </div>
+
+      <div className="card p-6">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="font-semibold text-gray-700">Monthly Expenses</h2>
+          <span className="text-sm font-bold text-red-500 bg-red-50 px-3 py-1 rounded-full">
+            {fmt(totalMonthly)} / mo
+          </span>
+        </div>
+        {expenses.length === 0 ? (
+          <p className="text-center text-gray-400 text-sm py-10">
+            No expenses yet — add one above.
+          </p>
+        ) : (
+          <div className="space-y-5">
+            {Object.entries(grouped).map(([cat, items]) => {
+              const catTotal = items.reduce((s, e) => s + toMonthly(e.amount, e.frequency), 0);
+              return (
+                <div key={cat}>
+                  <div className="flex items-center gap-2 mb-2">
+                    <Badge color={CAT_COLORS[cat] || 'gray'}>{cat}</Badge>
+                    <span className="text-xs text-gray-400">{fmt(catTotal)}/mo</span>
+                  </div>
+                  <div className="divide-y divide-gray-50 pl-2">
+                    {items.map(item => (
+                      <div key={item.id} className="flex items-center justify-between py-2.5 hover:bg-slate-50 -mx-2 px-2 rounded-lg">
+                        <span className="text-sm">{item.name}</span>
+                        <div className="flex items-center gap-3">
+                          <span className="text-sm font-semibold text-gray-600">
+                            {fmtFull(toMonthly(item.amount, item.frequency))}/mo
+                          </span>
+                          <Btn variant="ghost" onClick={() => startEdit(item)}>Edit</Btn>
+                          <Btn variant="danger" onClick={() => setExpenses(p => p.filter(e => e.id !== item.id))}>✕</Btn>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Debts Page ───────────────────────────────────────────────────────────────
+const DEBT_CATS = [
+  'Credit Card', 'Student Loan', 'Auto Loan',
+  'Personal Loan', 'Medical', 'Mortgage', 'Other',
+];
+const DEBT_CAT_COLORS = {
+  'Credit Card': 'red', 'Student Loan': 'blue', 'Auto Loan': 'amber',
+  'Personal Loan': 'purple', 'Medical': 'pink', 'Mortgage': 'teal', 'Other': 'gray',
+};
+const EMPTY_DEBT = { name: '', balance: '', apr: '', minimumPayment: '', category: 'Credit Card' };
+
+function DebtsPage({ debts, setDebts }) {
+  const [form, setForm] = useState(EMPTY_DEBT);
+  const [editId, setEditId] = useState(null);
+
+  const totalDebt = debts.reduce((s, d) => s + Number(d.balance), 0);
+  const f = (k) => (e) => setForm(p => ({ ...p, [k]: e.target.value }));
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    const item = {
+      ...form,
+      balance: Number(form.balance),
+      apr: Number(form.apr),
+      minimumPayment: Number(form.minimumPayment),
+    };
+    if (!item.name.trim() || item.balance <= 0) return;
+    if (editId) {
+      setDebts(prev => prev.map(d => d.id === editId ? { ...d, ...item } : d));
+      setEditId(null);
+    } else {
+      setDebts(prev => [...prev, { ...item, id: uid() }]);
+    }
+    setForm(EMPTY_DEBT);
+  };
+
+  const startEdit = (item) => {
+    setForm({
+      name: item.name,
+      balance: String(item.balance),
+      apr: String(item.apr),
+      minimumPayment: String(item.minimumPayment),
+      category: item.category || 'Other',
+    });
+    setEditId(item.id);
+  };
+
+  const cancel = () => { setEditId(null); setForm(EMPTY_DEBT); };
+
+  const highestApr = debts.length ? Math.max(...debts.map(d => d.apr)) : 0;
+
+  return (
+    <div className="space-y-6 fade-up">
+      <div className="card p-6">
+        <h2 className="font-semibold text-gray-700 mb-4">
+          {editId ? 'Edit Debt' : 'Add a Debt'}
+        </h2>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <Field label="Debt Name">
+              <TextInput placeholder="e.g. Chase Visa, Car Loan..." value={form.name} onChange={f('name')} required />
+            </Field>
+            <Field label="Category">
+              <SelectInput options={DEBT_CATS} value={form.category} onChange={f('category')} />
+            </Field>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <Field label="Current Balance ($)">
+              <TextInput placeholder="10,000" type="number" min="0.01" step="0.01" value={form.balance} onChange={f('balance')} required />
+            </Field>
+            <Field label="Interest Rate / APR (%)">
+              <TextInput placeholder="19.99" type="number" min="0" max="100" step="0.01" value={form.apr} onChange={f('apr')} required />
+            </Field>
+            <Field label="Minimum Monthly Payment ($)">
+              <TextInput placeholder="250" type="number" min="0" step="0.01" value={form.minimumPayment} onChange={f('minimumPayment')} required />
+            </Field>
+          </div>
+          <div className="flex gap-2">
+            <Btn type="submit">{editId ? 'Update Debt' : 'Add Debt'}</Btn>
+            {editId && <Btn type="button" variant="ghost" onClick={cancel}>Cancel</Btn>}
+          </div>
+        </form>
+      </div>
+
+      <div className="card p-6">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="font-semibold text-gray-700">Your Debts</h2>
+          {debts.length > 0 && (
+            <span className="text-sm font-bold text-red-500 bg-red-50 px-3 py-1 rounded-full">
+              Total: {fmt(totalDebt)}
+            </span>
+          )}
+        </div>
+        {debts.length === 0 ? (
+          <p className="text-center text-gray-400 text-sm py-10">
+            No debts added yet. Enter your debts above to calculate your payoff timeline.
+          </p>
+        ) : (
+          <div className="space-y-3">
+            {[...debts].sort((a, b) => b.balance - a.balance).map(item => {
+              const pct = totalDebt > 0 ? (item.balance / totalDebt) * 100 : 0;
+              const isHighestApr = item.apr >= highestApr && debts.length > 1;
+              return (
+                <div key={item.id} className="border border-gray-100 rounded-xl p-4 hover:shadow-sm transition-shadow">
+                  <div className="flex items-start justify-between mb-3">
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-semibold text-sm">{item.name}</span>
+                        <Badge color={DEBT_CAT_COLORS[item.category] || 'gray'}>{item.category}</Badge>
+                        {isHighestApr && <Badge color="red">Highest APR</Badge>}
+                      </div>
+                      <div className="flex gap-4 text-xs text-gray-500">
+                        <span>APR: <strong className="text-gray-700">{item.apr}%</strong></span>
+                        <span>Min payment: <strong className="text-gray-700">{fmtFull(item.minimumPayment)}/mo</strong></span>
+                      </div>
+                    </div>
+                    <div className="text-right shrink-0 ml-4">
+                      <p className="font-bold text-red-500 text-lg">{fmt(item.balance)}</p>
+                      <p className="text-xs text-gray-400">{pct.toFixed(1)}% of total</p>
+                    </div>
+                  </div>
+                  <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden mb-3">
+                    <div
+                      className="h-full bg-gradient-to-r from-red-400 to-red-500 rounded-full progress-bar"
+                      style={{ width: `${pct}%` }}
+                    />
+                  </div>
+                  <div className="flex justify-end gap-2">
+                    <Btn variant="ghost" onClick={() => startEdit(item)}>Edit</Btn>
+                    <Btn variant="danger" onClick={() => setDebts(p => p.filter(d => d.id !== item.id))}>Remove</Btn>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Dashboard ────────────────────────────────────────────────────────────────
+function PayoffStrategyCard({ title, emoji, result, borderColor, textColor }) {
+  if (!result) {
+    return (
+      <div className="card p-5">
+        <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">{emoji} {title}</p>
+        <p className="text-sm text-gray-400 mt-2">Add debts to see your payoff timeline.</p>
+      </div>
+    );
+  }
+  return (
+    <div className={`card p-5 border-t-[3px] ${borderColor}`}>
+      <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">{emoji} {title}</p>
+      <p className={`text-3xl font-bold mb-0.5 ${textColor}`}>{fmtMonths(result.totalMonths)}</p>
+      <p className="text-sm text-gray-500 mb-3">
+        Debt-free by <strong className="text-gray-700">{payoffDate(result.totalMonths)}</strong>
+      </p>
+      <p className="text-xs text-gray-400">Total interest paid: <strong>{fmt(result.totalInterest)}</strong></p>
+    </div>
+  );
+}
+
+function PayoffChart({ avalanche, snowball }) {
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+
+  useEffect(() => {
+    if (!canvasRef.current) return;
+    if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; }
+    if (!avalanche && !snowball) return;
+
+    const maxMonths = Math.max(avalanche?.totalMonths || 0, snowball?.totalMonths || 0);
+
+    const labels = Array.from({ length: maxMonths + 1 }, (_, i) => {
+      if (i === 0) return 'Now';
+      const d = new Date();
+      d.setMonth(d.getMonth() + i);
+      return i % 12 === 0
+        ? d.toLocaleDateString('en-US', { month: 'short', year: 'numeric' })
+        : '';
+    });
+
+    const datasets = [];
+    if (avalanche) {
+      datasets.push({
+        label: 'Avalanche',
+        data: avalanche.snapshots.map(s => Math.round(s.total)),
+        borderColor: '#4f46e5',
+        backgroundColor: 'rgba(79,70,229,0.07)',
+        fill: true,
+        tension: 0.35,
+        borderWidth: 2.5,
+        pointRadius: 0,
+        pointHoverRadius: 5,
+      });
+    }
+    if (snowball) {
+      datasets.push({
+        label: 'Snowball',
+        data: snowball.snapshots.map(s => Math.round(s.total)),
+        borderColor: '#10b981',
+        backgroundColor: 'rgba(16,185,129,0.07)',
+        fill: true,
+        tension: 0.35,
+        borderWidth: 2.5,
+        pointRadius: 0,
+        pointHoverRadius: 5,
+      });
+    }
+
+    chartRef.current = new Chart(canvasRef.current, {
+      type: 'line',
+      data: { labels, datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { position: 'top', labels: { usePointStyle: true, padding: 16, font: { size: 12 } } },
+          tooltip: {
+            callbacks: {
+              label: (ctx) => ` ${ctx.dataset.label}: ${fmt(ctx.parsed.y)}`,
+            },
+          },
+        },
+        scales: {
+          x: {
+            ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 8, font: { size: 11 } },
+            grid: { display: false },
+          },
+          y: {
+            beginAtZero: true,
+            ticks: { callback: (v) => fmt(v), font: { size: 11 } },
+            grid: { color: 'rgba(0,0,0,0.04)' },
+          },
+        },
+      },
+    });
+
+    return () => {
+      if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; }
+    };
+  }, [avalanche, snowball]);
+
+  return (
+    <div className="card p-6">
+      <h3 className="font-semibold text-gray-700 mb-4">Debt Payoff Timeline</h3>
+      {!avalanche && !snowball ? (
+        <div className="h-52 flex items-center justify-center text-gray-400 text-sm">
+          Add debts to see your payoff chart.
+        </div>
+      ) : (
+        <div style={{ height: '280px', position: 'relative' }}>
+          <canvas ref={canvasRef}></canvas>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PayoffTable({ debts, avalanche, snowball }) {
+  if (!debts.length) return null;
+  const sorted = [...debts].sort((a, b) => b.balance - a.balance);
+  return (
+    <div className="card p-6">
+      <h3 className="font-semibold text-gray-700 mb-4">Individual Debt Payoff Dates</h3>
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm min-w-[480px]">
+          <thead>
+            <tr className="text-xs font-semibold uppercase tracking-wide text-gray-400 border-b border-gray-100">
+              <th className="text-left pb-3">Debt</th>
+              <th className="text-right pb-3">Balance</th>
+              <th className="text-right pb-3">APR</th>
+              <th className="text-right pb-3">Min / mo</th>
+              <th className="text-right pb-3 text-indigo-500">Avalanche</th>
+              <th className="text-right pb-3 text-emerald-500">Snowball</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.map(d => (
+              <tr key={d.id} className="border-b border-gray-50 last:border-0 hover:bg-slate-50">
+                <td className="py-3 font-medium">{d.name}</td>
+                <td className="py-3 text-right">{fmt(d.balance)}</td>
+                <td className="py-3 text-right">{d.apr}%</td>
+                <td className="py-3 text-right">{fmt(d.minimumPayment)}</td>
+                <td className="py-3 text-right font-medium text-indigo-600">
+                  {payoffDate(avalanche?.payoffMonths?.[d.id])}
+                </td>
+                <td className="py-3 text-right font-medium text-emerald-600">
+                  {payoffDate(snowball?.payoffMonths?.[d.id])}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function Dashboard({ income, expenses, debts }) {
+  const totalIncome   = income.reduce((s, i) => s + toMonthly(i.amount, i.frequency), 0);
+  const totalExpenses = expenses.reduce((s, e) => s + toMonthly(e.amount, e.frequency), 0);
+  const totalMinimums = debts.reduce((s, d) => s + Number(d.minimumPayment), 0);
+  const totalDebt     = debts.reduce((s, d) => s + Number(d.balance), 0);
+  const cashFlow      = totalIncome - totalExpenses;
+  const extraForDebt  = Math.max(0, cashFlow - totalMinimums);
+
+  const avalanche = useMemo(
+    () => simulatePayoff(debts, extraForDebt, 'avalanche'),
+    [JSON.stringify(debts), extraForDebt]
+  );
+  const snowball = useMemo(
+    () => simulatePayoff(debts, extraForDebt, 'snowball'),
+    [JSON.stringify(debts), extraForDebt]
+  );
+
+  const cashFlowPositive = cashFlow >= 0;
+  const canCoverMinimums = cashFlow >= totalMinimums;
+
+  return (
+    <div className="space-y-6 fade-up">
+      {/* Summary cards */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <StatCard
+          label="Monthly Income"
+          value={fmt(totalIncome)}
+          sub={`${income.length} source${income.length !== 1 ? 's' : ''}`}
+          accent="#059669"
+          emoji="💰"
+        />
+        <StatCard
+          label="Monthly Expenses"
+          value={fmt(totalExpenses)}
+          sub={`${expenses.length} item${expenses.length !== 1 ? 's' : ''}`}
+          accent="#ef4444"
+          emoji="📋"
+        />
+        <StatCard
+          label="Monthly Cash Flow"
+          value={(cashFlow >= 0 ? '+' : '') + fmt(cashFlow)}
+          sub={debts.length > 0 ? `${fmt(extraForDebt)} available for extra debt payments` : 'After expenses'}
+          accent={cashFlowPositive ? '#4f46e5' : '#ef4444'}
+          emoji="📊"
+        />
+        <StatCard
+          label="Total Debt"
+          value={fmt(totalDebt)}
+          sub={`${debts.length} debt${debts.length !== 1 ? 's' : ''} · ${fmt(totalMinimums)}/mo minimums`}
+          accent="#d97706"
+          emoji="🏦"
+        />
+      </div>
+
+      {/* Alerts */}
+      {debts.length > 0 && !canCoverMinimums && (
+        <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-sm text-red-700">
+          ⚠️ <strong>Cash flow warning:</strong> Your monthly cash flow ({fmt(cashFlow)}) doesn't cover
+          your minimum debt payments ({fmt(totalMinimums)}). Focus on reducing expenses or increasing income first.
+        </div>
+      )}
+      {debts.length > 0 && canCoverMinimums && extraForDebt === 0 && (
+        <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 text-sm text-amber-700">
+          ⚡ You're covering minimum payments but have no extra to accelerate payoff.
+          Even an extra $50–$100/month can save you thousands in interest.
+        </div>
+      )}
+
+      {/* Strategy comparison */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <PayoffStrategyCard
+          title="Avalanche Method"
+          emoji="🏔️"
+          result={avalanche}
+          borderColor="border-indigo-500"
+          textColor="text-indigo-600"
+        />
+        <PayoffStrategyCard
+          title="Snowball Method"
+          emoji="⛄"
+          result={snowball}
+          borderColor="border-emerald-500"
+          textColor="text-emerald-600"
+        />
+      </div>
+
+      {/* Method explanation */}
+      {avalanche && snowball && (
+        <div className="bg-indigo-50 border border-indigo-100 rounded-xl p-4 text-sm text-indigo-700 space-y-1">
+          <p>
+            <strong>Avalanche</strong> targets highest-interest debts first — mathematically optimal, saves the most money.
+          </p>
+          <p>
+            <strong>Snowball</strong> targets lowest balances first — builds momentum by eliminating debts faster.
+          </p>
+          {avalanche.totalInterest < snowball.totalInterest ? (
+            <p className="font-medium mt-1">
+              💡 Avalanche saves you <strong>{fmt(snowball.totalInterest - avalanche.totalInterest)}</strong> in interest
+              {avalanche.totalMonths <= snowball.totalMonths ? '' : ` (${fmtMonths(avalanche.totalMonths - snowball.totalMonths)} longer)`}.
+            </p>
+          ) : (
+            <p className="font-medium mt-1">
+              💡 In your case both strategies perform similarly.
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Chart */}
+      <PayoffChart avalanche={avalanche} snowball={snowball} />
+
+      {/* Payoff table */}
+      <PayoffTable debts={debts} avalanche={avalanche} snowball={snowball} />
+
+      {/* Empty state */}
+      {income.length === 0 && expenses.length === 0 && debts.length === 0 && (
+        <div className="card p-10 text-center text-gray-400">
+          <p className="text-4xl mb-3">🚀</p>
+          <p className="font-semibold text-gray-600 mb-1">Get started in 3 steps</p>
+          <p className="text-sm">1. Add your income sources → 2. Add your monthly expenses → 3. Add your debts</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── App Shell ────────────────────────────────────────────────────────────────
+const TABS = [
+  { id: 'dashboard', label: 'Dashboard', emoji: '📊' },
+  { id: 'income',    label: 'Income',    emoji: '💰' },
+  { id: 'expenses',  label: 'Expenses',  emoji: '📋' },
+  { id: 'debts',     label: 'Debts',     emoji: '🏦' },
+];
+
+function load(key, fallback) {
+  try { return JSON.parse(localStorage.getItem(key) ?? 'null') ?? fallback; }
+  catch { return fallback; }
+}
+
+function App() {
+  const [tab,      setTab]      = useState('dashboard');
+  const [income,   setIncome]   = useState(() => load('df_income',   []));
+  const [expenses, setExpenses] = useState(() => load('df_expenses', []));
+  const [debts,    setDebts]    = useState(() => load('df_debts',    []));
+
+  useEffect(() => { localStorage.setItem('df_income',   JSON.stringify(income));   }, [income]);
+  useEffect(() => { localStorage.setItem('df_expenses', JSON.stringify(expenses)); }, [expenses]);
+  useEffect(() => { localStorage.setItem('df_debts',    JSON.stringify(debts));    }, [debts]);
+
+  const totalIncome = income.reduce((s, i) => s + toMonthly(i.amount, i.frequency), 0);
+  const totalExpenses = expenses.reduce((s, e) => s + toMonthly(e.amount, e.frequency), 0);
+  const totalDebt = debts.reduce((s, d) => s + Number(d.balance), 0);
+
+  return (
+    <div className="min-h-screen bg-slate-50">
+      {/* Header */}
+      <header className="bg-white border-b border-gray-100 sticky top-0 z-20 shadow-sm">
+        <div className="max-w-5xl mx-auto px-4">
+          <div className="flex items-center justify-between pt-4 pb-0">
+            <div>
+              <h1 className="text-xl font-extrabold text-gray-900 tracking-tight">DebtFree</h1>
+              <p className="text-xs text-gray-400 mb-0 pb-0">Personal Finance & Debt Payoff Calculator</p>
+            </div>
+            <div className="hidden sm:flex items-center gap-5 text-xs text-gray-500 pb-1">
+              <span>Income <strong className="text-emerald-600">{fmt(totalIncome)}</strong>/mo</span>
+              <span>Expenses <strong className="text-red-500">{fmt(totalExpenses)}</strong>/mo</span>
+              <span>Debt <strong className="text-amber-600">{fmt(totalDebt)}</strong></span>
+            </div>
+          </div>
+          {/* Tab nav */}
+          <nav className="flex -mb-px mt-2">
+            {TABS.map(t => (
+              <button
+                key={t.id}
+                onClick={() => setTab(t.id)}
+                className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors whitespace-nowrap ${
+                  tab === t.id
+                    ? 'border-indigo-600 text-indigo-600'
+                    : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+                }`}
+              >
+                <span className="mr-1.5">{t.emoji}</span>
+                <span className="hidden sm:inline">{t.label}</span>
+              </button>
+            ))}
+          </nav>
+        </div>
+      </header>
+
+      {/* Page content */}
+      <main className="max-w-5xl mx-auto px-4 py-7">
+        {tab === 'dashboard' && <Dashboard income={income} expenses={expenses} debts={debts} />}
+        {tab === 'income'    && <IncomePage income={income} setIncome={setIncome} />}
+        {tab === 'expenses'  && <ExpensesPage expenses={expenses} setExpenses={setExpenses} />}
+        {tab === 'debts'     && <DebtsPage debts={debts} setDebts={setDebts} />}
+      </main>
+
+      <footer className="text-center text-xs text-gray-400 py-8 border-t border-gray-100 mt-8">
+        All data is stored locally in your browser — nothing is sent to any server.
+      </footer>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+</body>
+</html>
