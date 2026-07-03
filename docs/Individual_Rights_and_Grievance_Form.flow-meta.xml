@@ -1511,7 +1511,6 @@
                     </defaultValue>
                     <fieldText>I would like to file a (check only one)</fieldText>
                     <fieldType>RadioButtonGroup</fieldType>
-                    <inputsOnNextNavToAssocScrn>ResetValues</inputsOnNextNavToAssocScrn>
                     <isDisabled>true</isDisabled>
                     <isRequired>false</isRequired>
                     <styleProperties>
