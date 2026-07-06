@@ -612,7 +612,7 @@
             <fieldType>InputField</fieldType>
             <inputsOnNextNavToAssocScrn>ResetValues</inputsOnNextNavToAssocScrn>
             <isDisabled>true</isDisabled>
-            <isRequired>true</isRequired>
+            <isRequired>false</isRequired>
             <styleProperties>
                 <verticalAlignment>
                     <stringValue>top</stringValue>
